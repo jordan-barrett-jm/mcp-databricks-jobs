@@ -1,0 +1,7 @@
+# MCP Server dependencies
+mcp>=1.0.0,<2.0.0
+databricks-sdk>=0.30.0
+
+# Transitive but pinned for reproducibility
+httpx>=0.25.0
+pydantic>=2.0.0

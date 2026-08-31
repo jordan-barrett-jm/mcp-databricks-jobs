@@ -1,0 +1,11 @@
+# Databricks App configuration for the MCP Job Server
+# Deploys as a persistent HTTP service using the Streamable HTTP transport (/mcp).
+
+command:
+  - "python"
+  - "app.py"
+
+env:
+  - name: DAB_PROJECT_DIR
+    description: "Path to the DAB project repo (cloned inside the app container)"
+    value: "/app"

@@ -1,0 +1,49 @@
+# Declarative Automation Bundle configuration
+# Defines a serverless job that runs a simple data transformation.
+
+bundle:
+  name: sample_transform_bundle
+
+workspace:
+  root_path: ~/.bundle/${bundle.name}/${bundle.target}
+
+resources:
+  jobs:
+    sample_transform_job:
+      name: sample_transform_job_${bundle.target}
+      description: "Sample transform job deployed via DAB — used by MCP server"
+      tags:
+        managed_by: "mcp-server"
+        bundle: "sample_transform_bundle"
+
+      # Serverless — no cluster spec required
+      tasks:
+        - task_key: transform
+          notebook_task:
+            notebook_path: ./src/transform_job.py
+
+      # Queue to prevent resource contention
+      queue:
+        enabled: true
+
+      # Email notifications on failure (customize as needed)
+      # email_notifications:
+      #   on_failure:
+      #     - your-email@company.com
+
+targets:
+  dev:
+    default: true
+    mode: development
+
+  prod:
+    mode: production
+    resources:
+      jobs:
+        sample_transform_job:
+          name: sample_transform_job_prod
+          schedule:
+            # Example: run daily at 6 AM UTC — uncomment to enable
+            # quartz_cron_expression: "0 0 6 * * ?"
+            # timezone_id: "UTC"
+            pause_status: PAUSED
