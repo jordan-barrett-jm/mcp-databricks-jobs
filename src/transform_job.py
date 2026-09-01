@@ -70,7 +70,7 @@ transformed = (
 # Display results (visible in job run output)
 transformed.show(truncate=False)
 print(f"\nTransformation complete: {transformed.count()} region-product combinations processed.")
-print(f"Total revenue: ${transformed.agg(F.sum(\"total_revenue\")).first()[0]:,.2f}")
+print(f"Total revenue: ${transformed.agg(F.sum('total_revenue')).first()[0]:,.2f}")
 
 # COMMAND ----------
 
