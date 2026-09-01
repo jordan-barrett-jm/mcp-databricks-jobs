@@ -14,7 +14,6 @@ Authentication:
 """
 
 import os
-import subprocess
 import statistics
 from datetime import datetime
 from typing import Optional
@@ -36,8 +35,11 @@ PORT = int(os.environ.get("DATABRICKS_APP_PORT", os.environ.get("APP_PORT", "800
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 
-# DAB project directory (set via app env or default)
-DAB_PROJECT_DIR = os.environ.get("DAB_PROJECT_DIR", "/app")
+# Workspace Git folder path — the app pulls latest code here via the Repos API
+WORKSPACE_REPO_PATH = os.environ.get(
+    "WORKSPACE_REPO_PATH",
+    "/Workspace/Users/jordan.barrett@factored.ai/mcp-databricks-jobs"
+)
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -78,64 +80,49 @@ def _find_job(client: WorkspaceClient, job_name: str):
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def deploy(git_ref: str = "main", target: str = "dev") -> str:
+def deploy(git_ref: str = "main") -> str:
     """
-    Deploy the Databricks job via Declarative Automation Bundles.
+    Deploy the latest job code by pulling the newest changes from Git
+    into the workspace Git folder.
 
-    Checks out the specified git ref, pulls latest changes, then runs
-    `databricks bundle deploy` against the chosen target.
+    The job notebook lives inside the Git folder, so pulling the latest
+    ref automatically updates the code that runs on the next job trigger.
 
     Args:
-        git_ref: Branch or tag to checkout (default: main).
-        target: DAB target environment (default: dev).
+        git_ref: Branch or tag to sync to (default: main).
 
     Returns:
-        Deployment result with status and any error output.
+        Deployment result including the branch and latest commit hash.
     """
-    project_dir = DAB_PROJECT_DIR
+    client = _get_client()
 
-    # Git checkout
-    checkout = subprocess.run(
-        ["git", "checkout", git_ref],
-        cwd=project_dir,
-        capture_output=True,
-        text=True,
-    )
-    if checkout.returncode != 0:
-        return f"\u274c git checkout failed:\n{checkout.stderr.strip()}"
+    # Find the repo by path
+    repo = None
+    for r in client.repos.list(path_prefix=WORKSPACE_REPO_PATH):
+        if r.path and r.path.rstrip("/") == WORKSPACE_REPO_PATH.rstrip("/"):
+            repo = r
+            break
 
-    # Git pull
-    pull = subprocess.run(
-        ["git", "pull", "origin", git_ref],
-        cwd=project_dir,
-        capture_output=True,
-        text=True,
-    )
-    if pull.returncode != 0:
-        return f"\u274c git pull failed:\n{pull.stderr.strip()}"
+    if not repo:
+        return (
+            f"\u274c Git folder not found at {WORKSPACE_REPO_PATH}.\n"
+            f"   Ensure the repo is cloned in the workspace."
+        )
 
-    # DAB deploy
-    deploy_env = {**os.environ}
-    if DATABRICKS_HOST:
-        deploy_env["DATABRICKS_HOST"] = DATABRICKS_HOST
-    if DATABRICKS_TOKEN:
-        deploy_env["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
+    # Update the repo to the specified branch (pulls latest from remote)
+    try:
+        updated = client.repos.update(repo_id=repo.id, branch=git_ref)
+    except Exception as e:
+        return f"\u274c Failed to pull latest from '{git_ref}':\n   {e}"
 
-    deploy_proc = subprocess.run(
-        ["databricks", "bundle", "deploy", "--target", target],
-        cwd=project_dir,
-        capture_output=True,
-        text=True,
-        env=deploy_env,
-    )
-    if deploy_proc.returncode != 0:
-        return f"\u274c bundle deploy failed:\n{deploy_proc.stderr.strip()}"
+    head_commit = getattr(updated, 'head_commit_id', 'unknown')
 
     return (
         f"\u2705 Deployed successfully\n"
+        f"   Git folder: {WORKSPACE_REPO_PATH}\n"
         f"   Branch: {git_ref}\n"
-        f"   Target: {target}\n"
-        f"   Output: {deploy_proc.stdout.strip()[-800:]}"
+        f"   Commit: {head_commit}\n"
+        f"   The job will use the updated code on the next run."
     )
 
 

@@ -6,6 +6,6 @@ command:
   - "app.py"
 
 env:
-  - name: DAB_PROJECT_DIR
-    description: "Path to the DAB project repo (cloned inside the app container)"
-    value: "/app"
+  - name: WORKSPACE_REPO_PATH
+    description: "Workspace Git folder path — the deploy tool pulls latest code here"
+    value: "/Workspace/Users/jordan.barrett@factored.ai/mcp-databricks-jobs"
