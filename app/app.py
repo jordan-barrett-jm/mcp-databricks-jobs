@@ -143,10 +143,37 @@ def _cli_path():
     return os.environ.get("DATABRICKS_CLI_PATH") or shutil.which("databricks")
 
 
-# The CLI is a Go binary with no pip package, so it cannot come in through
-# requirements.txt. Fetch it once per container and cache it in /tmp.
+# Neither the Databricks CLI nor Terraform can arrive via requirements.txt --
+# both are Go binaries with no pip package. Fetch each once per container and
+# cache it in /tmp. Versions come from `databricks bundle debug terraform`.
 CLI_VERSION = os.environ.get("DATABRICKS_CLI_VERSION", "1.14.1")
+TF_VERSION = os.environ.get("DATABRICKS_TF_VERSION", "1.5.5")
 _CLI_CACHE = "/tmp/databricks"
+_TF_CACHE = "/tmp/terraform"
+
+
+def _fetch_zipped_binary(url: str, member: str, target: str):
+    """Download a zip and extract one executable member to /tmp.
+
+    Returns (path, error). Both binaries ship as a single-member zip, so the
+    same three steps -- fetch, extract, chmod +x -- cover each of them.
+    """
+    if os.path.exists(target) and os.access(target, os.X_OK):
+        return target, None
+    try:
+        import stat
+        import urllib.request
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "download.zip")
+            urllib.request.urlretrieve(url, archive)
+            with zipfile.ZipFile(archive) as z:
+                z.extract(member, "/tmp")
+        os.chmod(target, os.stat(target).st_mode | stat.S_IEXEC)
+        return target, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def _ensure_cli():
@@ -158,32 +185,55 @@ def _ensure_cli():
     found = _cli_path()
     if found:
         return found, None
-    if os.path.exists(_CLI_CACHE) and os.access(_CLI_CACHE, os.X_OK):
-        return _CLI_CACHE, None
 
     url = (
         f"https://github.com/databricks/cli/releases/download/v{CLI_VERSION}"
         f"/databricks_cli_{CLI_VERSION}_linux_amd64.zip"
     )
-    try:
-        import stat
-        import urllib.request
-        import zipfile
+    path, error = _fetch_zipped_binary(url, "databricks", _CLI_CACHE)
+    if path:
+        return path, None
+    return None, (
+        f"could not fetch the Databricks CLI ({error}).\n"
+        f"   The app container may have no outbound access to github.com. "
+        f"Stage the binary in a UC Volume and point DATABRICKS_CLI_PATH at a "
+        f"copy, or install it into the app image."
+    )
 
-        with tempfile.TemporaryDirectory() as td:
-            archive = os.path.join(td, "cli.zip")
-            urllib.request.urlretrieve(url, archive)
-            with zipfile.ZipFile(archive) as z:
-                z.extract("databricks", "/tmp")
-        os.chmod(_CLI_CACHE, os.stat(_CLI_CACHE).st_mode | stat.S_IEXEC)
-        return _CLI_CACHE, None
-    except Exception as e:
+
+def _ensure_terraform():
+    """Stage Terraform and point the CLI at it via DATABRICKS_TF_EXEC_PATH.
+
+    `bundle deploy` shells out to Terraform, and the CLI's own downloader
+    verifies HashiCorp's GPG signature -- which currently fails outright with
+    "unable to verify checksums signature: openpgp: key expired". Fetching the
+    release archive directly skips that check, and DATABRICKS_TF_EXEC_PATH
+    stops the CLI from trying to download it at all.
+
+    A local `databricks bundle deploy` never hits this: it reuses a Terraform
+    binary cached from before the key expired. Only a fresh container does.
+    """
+    existing = os.environ.get("DATABRICKS_TF_EXEC_PATH")
+    if existing:
+        return existing, None
+
+    url = (
+        f"https://releases.hashicorp.com/terraform/{TF_VERSION}"
+        f"/terraform_{TF_VERSION}_linux_amd64.zip"
+    )
+    path, error = _fetch_zipped_binary(url, "terraform", _TF_CACHE)
+    if not path:
         return None, (
-            f"could not fetch the Databricks CLI ({type(e).__name__}: {e}).\n"
-            f"   The app container may have no outbound access to github.com. "
-            f"Stage the binary in a UC Volume and point DATABRICKS_CLI_PATH at a "
-            f"copy, or install it into the app image."
+            f"could not fetch Terraform {TF_VERSION} ({error}).\n"
+            f"   `bundle deploy` needs it. Stage it in a UC Volume and set "
+            f"DATABRICKS_TF_EXEC_PATH, or set DATABRICKS_TF_VERSION if the "
+            f"pinned version has moved."
         )
+
+    # _run() inherits os.environ, so setting these here is enough.
+    os.environ["DATABRICKS_TF_EXEC_PATH"] = path
+    os.environ["DATABRICKS_TF_VERSION"] = TF_VERSION
+    return path, None
 
 
 def _run(args, cwd, timeout: int = 120):
@@ -290,7 +340,15 @@ def _pull_repo(client: WorkspaceClient, git_ref: str):
                 f"   Ensure it was cloned as a Repo, not a plain workspace directory."
             )
         return None, f"Failed to pull latest from '{git_ref}':\n   {e}"
-    return getattr(updated, "head_commit_id", "unknown"), None
+    # update() does not always echo the new head, so fall back to a read.
+    head = getattr(updated, "head_commit_id", None)
+    if not head:
+        try:
+            head = getattr(client.repos.get(repo_id=status.object_id),
+                           "head_commit_id", None)
+        except Exception:
+            head = None
+    return head or "unknown", None
 
 
 def _export_workspace_dir(client: WorkspaceClient, remote: str, local: str) -> int:
@@ -375,13 +433,18 @@ def deploy(git_ref: str = "main", target: str = "dev") -> str:
         f"   Commit: {head_commit}\n"
     )
 
+    skipped = (
+        "\n   Only the Git folder was refreshed, so databricks.yml changes\n"
+        "   (schedules, tasks, tags, compute) have NOT been applied."
+    )
+
     cli, cli_error = _ensure_cli()
     if not cli:
-        return pulled + (
-            f"\n\u26a0\ufe0f  Bundle NOT deployed: {cli_error}\n"
-            "   Only the Git folder was refreshed, so databricks.yml changes\n"
-            "   (schedules, tasks, tags, compute) have NOT been applied."
-        )
+        return pulled + f"\n\u26a0\ufe0f  Bundle NOT deployed: {cli_error}" + skipped
+
+    _, tf_error = _ensure_terraform()
+    if tf_error:
+        return pulled + f"\n\u26a0\ufe0f  Bundle NOT deployed: {tf_error}" + skipped
 
     project_dir, error = _materialize_bundle(client)
     if error:
