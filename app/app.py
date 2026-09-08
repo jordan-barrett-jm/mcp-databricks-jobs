@@ -143,6 +143,49 @@ def _cli_path():
     return os.environ.get("DATABRICKS_CLI_PATH") or shutil.which("databricks")
 
 
+# The CLI is a Go binary with no pip package, so it cannot come in through
+# requirements.txt. Fetch it once per container and cache it in /tmp.
+CLI_VERSION = os.environ.get("DATABRICKS_CLI_VERSION", "1.14.1")
+_CLI_CACHE = "/tmp/databricks"
+
+
+def _ensure_cli():
+    """Return a usable CLI path, downloading the binary on first use.
+
+    Returns (path, note): `note` explains a failure, so `deploy` can say why
+    the bundle step was skipped instead of reporting a bare "not available".
+    """
+    found = _cli_path()
+    if found:
+        return found, None
+    if os.path.exists(_CLI_CACHE) and os.access(_CLI_CACHE, os.X_OK):
+        return _CLI_CACHE, None
+
+    url = (
+        f"https://github.com/databricks/cli/releases/download/v{CLI_VERSION}"
+        f"/databricks_cli_{CLI_VERSION}_linux_amd64.zip"
+    )
+    try:
+        import stat
+        import urllib.request
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as td:
+            archive = os.path.join(td, "cli.zip")
+            urllib.request.urlretrieve(url, archive)
+            with zipfile.ZipFile(archive) as z:
+                z.extract("databricks", "/tmp")
+        os.chmod(_CLI_CACHE, os.stat(_CLI_CACHE).st_mode | stat.S_IEXEC)
+        return _CLI_CACHE, None
+    except Exception as e:
+        return None, (
+            f"could not fetch the Databricks CLI ({type(e).__name__}: {e}).\n"
+            f"   The app container may have no outbound access to github.com. "
+            f"Stage the binary in a UC Volume and point DATABRICKS_CLI_PATH at a "
+            f"copy, or install it into the app image."
+        )
+
+
 def _run(args, cwd, timeout: int = 120):
     """Run a subprocess, returning (returncode, combined stdout+stderr).
 
@@ -332,13 +375,12 @@ def deploy(git_ref: str = "main", target: str = "dev") -> str:
         f"   Commit: {head_commit}\n"
     )
 
-    cli = _cli_path()
+    cli, cli_error = _ensure_cli()
     if not cli:
         return pulled + (
-            "\n\u26a0\ufe0f  Bundle NOT deployed: the Databricks CLI is not available in this app\n"
-            "   container, so only the Git folder was refreshed and databricks.yml changes\n"
-            "   have not been applied. Install the CLI into the app image or set\n"
-            "   DATABRICKS_CLI_PATH, or run the deploy from the local stdio server."
+            f"\n\u26a0\ufe0f  Bundle NOT deployed: {cli_error}\n"
+            "   Only the Git folder was refreshed, so databricks.yml changes\n"
+            "   (schedules, tasks, tags, compute) have NOT been applied."
         )
 
     project_dir, error = _materialize_bundle(client)
@@ -361,6 +403,74 @@ def deploy(git_ref: str = "main", target: str = "dev") -> str:
     if out:
         lines.append(f"   Output: {out[-800:]}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool 1b: Register this app's own Git credential
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def register_git_credential(
+    personal_access_token: str,
+    git_username: str,
+    git_provider: str = "gitHub",
+) -> str:
+    """
+    One-time bootstrap: register a Git credential for THIS app's service principal.
+
+    Databricks stores Git credentials per principal. A hosted app calls the
+    Repos API as its own service principal, which starts life with no
+    credential, so `deploy` cannot pull from a private repo until one exists.
+
+    The usual advice -- have an admin add one via Settings > Identity and
+    access, or call the API with `principal_id` -- needs service principal
+    manager rights. This does not: the app is already authenticated as the
+    service principal, and omitting `principal_id` creates the credential for
+    the *caller*. Self-registration needs no elevated rights; only modifying
+    another principal's credentials does.
+
+    Args:
+        personal_access_token: Git provider PAT. For GitHub, a fine-grained
+            token with Contents:Read on the bundle's repo is enough. Databricks
+            stores and reuses this token, so revoking it breaks the credential.
+        git_username: Username at the Git provider (not the Databricks user).
+        git_provider: Provider key, e.g. gitHub, gitLab, bitbucketCloud.
+
+    Returns:
+        The new credential id, or an explanation of why registration failed.
+    """
+    client = _get_client()
+
+    try:
+        existing = list(client.git_credentials.list())
+    except Exception as e:
+        return f"❌ Could not list existing credentials: {e}"
+
+    for cred in existing:
+        if (cred.git_provider or "").lower() == git_provider.lower():
+            return (
+                f"⚠️  This service principal already has a {git_provider} "
+                f"credential (id {getattr(cred, 'credential_id', 'unknown')}).\n"
+                f"   Delete it first if you mean to replace it."
+            )
+
+    try:
+        # No principal_id: the credential is created for the calling principal,
+        # which is this app. That is what makes this work without an admin.
+        created = client.git_credentials.create(
+            git_provider,
+            git_username=git_username,
+            personal_access_token=personal_access_token,
+        )
+    except Exception as e:
+        return f"❌ Failed to register credential: {e}"
+
+    return (
+        f"✅ Registered a {git_provider} credential "
+        f"(id {getattr(created, 'credential_id', 'unknown')}) for this app's "
+        f"service principal.\n"
+        f"   `deploy` can now pull from the workspace Git folder."
+    )
 
 
 # ---------------------------------------------------------------------------
