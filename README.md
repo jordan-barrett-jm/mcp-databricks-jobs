@@ -78,6 +78,19 @@ To connect an external client (VS Code, Codex, etc.) to the hosted app:
 Databricks token" requirement directly, since the token is only used outbound (server-to-Databricks),
 not for inbound client access.
 
+### The hosted app needs the Databricks CLI to deploy
+
+The app's `deploy` tool shells out to `databricks bundle deploy`, so the CLI must be reachable
+from the app container — on `PATH`, or pointed at by `DATABRICKS_CLI_PATH`. Without it the app
+can only refresh the workspace Git folder, which updates notebook source but leaves
+`databricks.yml` changes (schedules, tasks, tags, compute) unapplied; the tool reports that
+explicitly instead of claiming success.
+
+The bundle itself does not need to be in the app's source path: `deploy` exports it from
+`WORKSPACE_REPO_PATH` into a temp directory. Set `DAB_PROJECT_DIR` if the bundle is already
+present in the container and you want to skip the export. Outbound CLI auth uses the app's
+service principal, which must have permission to deploy the bundle's resources.
+
 ### Redeploying the hosted app after code changes
 
 ```bash
@@ -101,6 +114,10 @@ pip install -r requirements.txt
 export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
 export DATABRICKS_TOKEN="dapi_xxxxxxxxxxxxxxxx"
 export DAB_PROJECT_DIR="$(pwd)"   # points to this repo root
+
+# Optional
+export DATABRICKS_CLI_PATH="/opt/homebrew/bin/databricks"  # if the CLI is not on PATH
+export DAB_DEPLOY_TIMEOUT=900                              # seconds; caps `bundle deploy`
 ```
 
 ### 3. Deploy the job first
@@ -181,6 +198,17 @@ python mcp_server.py
 | `get_job_status` | Full status: lifecycle, result, duration, error codes & stack traces |
 | `cancel_run` | Cancels an active run (latest active if no run_id specified) |
 
+### A note on job names
+
+DAB does not deploy the job under the name in `databricks.yml`. The bundle names it
+`sample_transform_job_${bundle.target}`, and `mode: development` prefixes it again, so a dev
+deploy lands in the workspace as `[dev jordan_barrett] sample_transform_job_dev`.
+
+The tools account for this: `job_name` is matched exactly first, then against the deployed
+name with the dev prefix stripped and the target suffix allowed. If a name matches several
+deployed jobs — typically because both `dev` and `prod` are deployed — the tools list the
+candidates and ask you to pass a full name rather than picking one silently.
+
 ## Tool Parameters
 
 ### `deploy`
@@ -188,6 +216,12 @@ python mcp_server.py
 | --- | --- | --- |
 | `git_ref` | `"main"` | Branch/tag to checkout |
 | `target` | `"dev"` | DAB target (dev, prod) |
+
+Both the local server and the hosted app run `databricks bundle deploy --target <target>
+--auto-approve` — `--auto-approve` because there is no one to answer an interactive prompt.
+The local server checks out and pulls first; the hosted app pulls the workspace Git folder,
+exports the bundle from it, then deploys. If the CLI is unavailable the app says
+**"Bundle NOT deployed"** rather than reporting success for a Git pull alone.
 
 ### `run_job`
 | Param | Default | Description |

@@ -13,14 +13,20 @@ Authentication:
   to call the Jobs API, unless DATABRICKS_TOKEN is explicitly overridden.
 """
 
+import json
 import os
+import re
+import shutil
 import statistics
+import subprocess
+import tempfile
 from datetime import datetime
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.jobs import RunLifeCycleState, RunResultState
+from databricks.sdk.service.workspace import ExportFormat, Language, ObjectType
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -67,63 +73,268 @@ def _get_client() -> WorkspaceClient:
     return WorkspaceClient(**kwargs)
 
 
+# DAB's `mode: development` prefixes every deployed resource, e.g.
+# "[dev jordan_barrett] sample_transform_job_dev".
+_DEV_PREFIX = re.compile(r"^\[[^\]]*\]\s*")
+
+
+class JobNotResolved(Exception):
+    """A job name matched no deployed job, or matched several."""
+
+
+def _matches_deployed_name(actual: str, wanted: str) -> bool:
+    """True if `actual` is `wanted` carrying DAB's dev prefix and/or target suffix."""
+    base = _DEV_PREFIX.sub("", actual)
+    return base == wanted or base.startswith(wanted + "_")
+
+
 def _find_job(client: WorkspaceClient, job_name: str):
-    """Resolve a job by exact name."""
-    for job in client.jobs.list(name=job_name):
-        if job.settings and job.settings.name == job_name:
+    """Resolve a job by the name DAB actually deploys it under.
+
+    databricks.yml names the job `sample_transform_job_${bundle.target}`, and
+    `mode: development` prefixes it further, so a dev deploy lands in the
+    workspace as `[dev jordan_barrett] sample_transform_job_dev`. Matching on
+    the exact string alone therefore never finds a bundle-deployed job.
+
+    An exact match wins outright. Otherwise the dev prefix is stripped and the
+    target suffix allowed, and an ambiguous result is reported rather than
+    guessed at -- pass the full workspace name as `job_name` to pin one down.
+
+    Raises:
+        JobNotResolved: if the name matches no job, or several.
+    """
+    candidates = []
+    for job in client.jobs.list(expand_tasks=False):
+        name = job.settings.name if job.settings else None
+        if not name:
+            continue
+        if name == job_name:
             return job
-    return None
+        if _matches_deployed_name(name, job_name):
+            candidates.append(job)
+
+    if not candidates:
+        raise JobNotResolved(
+            f"Job '{job_name}' not found. Deploy first with the `deploy` tool."
+        )
+    if len(candidates) > 1:
+        listed = "\n".join(
+            f"     - {j.settings.name} (ID: {j.job_id})" for j in candidates
+        )
+        raise JobNotResolved(
+            f"Job '{job_name}' is ambiguous -- {len(candidates)} deployed jobs match:\n"
+            f"{listed}\n"
+            f"   Re-run with job_name set to one of the names above."
+        )
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
 # Tool 1: Deploy
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def deploy(git_ref: str = "main") -> str:
+# `bundle deploy` can run for minutes; cap it so a wedged CLI cannot hang the
+# server forever.
+DEPLOY_TIMEOUT_SECONDS = int(os.environ.get("DAB_DEPLOY_TIMEOUT", "900"))
+
+
+def _cli_path():
+    """Path to the Databricks CLI, or None if it is not installed."""
+    return os.environ.get("DATABRICKS_CLI_PATH") or shutil.which("databricks")
+
+
+def _run(args, cwd, timeout: int = 120):
+    """Run a subprocess, returning (returncode, combined stdout+stderr).
+
+    stdin is closed so an unexpected CLI prompt fails fast instead of blocking
+    the transport, and both streams are kept because the Databricks CLI writes
+    its progress to stderr even on success.
     """
-    Deploy the latest job code by pulling the newest changes from Git
-    into the workspace Git folder.
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return 127, f"`{args[0]}` not found on PATH."
+    except subprocess.TimeoutExpired:
+        return 124, f"`{' '.join(args)}` timed out after {timeout}s."
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
 
-    The job notebook lives inside the Git folder, so pulling the latest
-    ref automatically updates the code that runs on the next job trigger.
 
-    Args:
-        git_ref: Branch or tag to sync to (default: main).
+def _deployed_job_names(cli: str, project_dir: str, target: str) -> str:
+    """Workspace names of the bundle's jobs, read back from `bundle summary`.
 
-    Returns:
-        Deployment result including the branch and latest commit hash.
+    Best-effort: the deploy already succeeded by the time this runs, so any
+    failure here just omits the detail rather than failing the tool.
     """
-    client = _get_client()
+    rc, out = _run(
+        [cli, "bundle", "summary", "--target", target, "--output", "json"],
+        project_dir,
+    )
+    if rc != 0:
+        return ""
+    try:
+        summary = json.loads(out).get("resources", {}).get("jobs", {})
+    except (ValueError, AttributeError):
+        return ""
+    lines = []
+    for key, info in summary.items():
+        if not isinstance(info, dict):
+            info = {}
+        name = info.get("name") or key
+        job_id = info.get("id")
+        lines.append(f"     - {name}" + (f" (ID: {job_id})" if job_id else ""))
+    return "\n".join(lines)
 
-    # Find the repo by path
+
+# Bundle root on the app container. Databricks Apps only sync the source path
+# passed to `apps deploy` (this app/ directory), so databricks.yml is normally
+# absent here and gets exported from the workspace Git folder instead.
+DAB_PROJECT_DIR = os.environ.get("DAB_PROJECT_DIR", "")
+
+_SOURCE_SUFFIX = {
+    Language.PYTHON: ".py",
+    Language.SQL: ".sql",
+    Language.SCALA: ".scala",
+    Language.R: ".r",
+}
+
+
+def _pull_repo(client: WorkspaceClient, git_ref: str):
+    """Pull the workspace Git folder to `git_ref`. Returns (head_commit, error)."""
     repo = None
     for r in client.repos.list(path_prefix=WORKSPACE_REPO_PATH):
         if r.path and r.path.rstrip("/") == WORKSPACE_REPO_PATH.rstrip("/"):
             repo = r
             break
-
     if not repo:
-        return (
-            f"\u274c Git folder not found at {WORKSPACE_REPO_PATH}.\n"
+        return None, (
+            f"Git folder not found at {WORKSPACE_REPO_PATH}.\n"
             f"   Ensure the repo is cloned in the workspace."
         )
-
-    # Update the repo to the specified branch (pulls latest from remote)
     try:
         updated = client.repos.update(repo_id=repo.id, branch=git_ref)
     except Exception as e:
-        return f"\u274c Failed to pull latest from '{git_ref}':\n   {e}"
+        return None, f"Failed to pull latest from '{git_ref}':\n   {e}"
+    return getattr(updated, "head_commit_id", "unknown"), None
 
-    head_commit = getattr(updated, 'head_commit_id', 'unknown')
 
-    return (
-        f"\u2705 Deployed successfully\n"
+def _export_workspace_dir(client: WorkspaceClient, remote: str, local: str) -> int:
+    """Recursively download a workspace directory to local disk. Returns file count."""
+    os.makedirs(local, exist_ok=True)
+    count = 0
+    for obj in client.workspace.list(remote):
+        name = (obj.path or "").rsplit("/", 1)[-1]
+        if not name:
+            continue
+        if obj.object_type == ObjectType.DIRECTORY:
+            count += _export_workspace_dir(client, obj.path, os.path.join(local, name))
+            continue
+        if obj.object_type == ObjectType.NOTEBOOK:
+            # Git folders store .py notebooks with the extension stripped, so
+            # export as SOURCE and put the extension back for the bundle.
+            data = client.workspace.download(obj.path, format=ExportFormat.SOURCE).read()
+            suffix = _SOURCE_SUFFIX.get(obj.language, ".py")
+            if not name.endswith(suffix):
+                name += suffix
+        elif obj.object_type == ObjectType.FILE:
+            data = client.workspace.download(obj.path).read()
+        else:
+            continue
+        with open(os.path.join(local, name), "wb") as fh:
+            fh.write(data)
+        count += 1
+    return count
+
+
+def _materialize_bundle(client: WorkspaceClient):
+    """Get a bundle root on local disk, returning (path, error).
+
+    Prefers DAB_PROJECT_DIR when it exists in the container; otherwise exports
+    the freshly pulled workspace Git folder to a temp dir so the CLI has a
+    databricks.yml to deploy.
+    """
+    if DAB_PROJECT_DIR and os.path.isfile(os.path.join(DAB_PROJECT_DIR, "databricks.yml")):
+        return DAB_PROJECT_DIR, None
+
+    dest = os.path.join(tempfile.gettempdir(), "dab-bundle")
+    shutil.rmtree(dest, ignore_errors=True)
+    try:
+        count = _export_workspace_dir(client, WORKSPACE_REPO_PATH, dest)
+    except Exception as e:
+        return None, f"could not export the bundle from {WORKSPACE_REPO_PATH}: {e}"
+    if not os.path.isfile(os.path.join(dest, "databricks.yml")):
+        return None, (
+            f"no databricks.yml found under {WORKSPACE_REPO_PATH} "
+            f"({count} files exported)."
+        )
+    return dest, None
+
+
+@mcp.tool()
+def deploy(git_ref: str = "main", target: str = "dev") -> str:
+    """
+    Deploy the job: pull the latest code into the workspace Git folder, then run
+    `databricks bundle deploy` so job definition changes actually take effect.
+
+    Pulling alone only refreshes notebook source; changes to databricks.yml
+    (schedules, tasks, tags, compute) need the bundle deploy.
+
+    Args:
+        git_ref: Branch or tag to sync to (default: main).
+        target: DAB target to deploy to (default: dev).
+
+    Returns:
+        The result of both steps, and an explicit warning if the bundle deploy
+        could not be run.
+    """
+    client = _get_client()
+
+    head_commit, error = _pull_repo(client, git_ref)
+    if error:
+        return f"\u274c {error}"
+
+    pulled = (
+        f"\u2705 Pulled latest code\n"
         f"   Git folder: {WORKSPACE_REPO_PATH}\n"
         f"   Branch: {git_ref}\n"
         f"   Commit: {head_commit}\n"
-        f"   The job will use the updated code on the next run."
     )
+
+    cli = _cli_path()
+    if not cli:
+        return pulled + (
+            "\n\u26a0\ufe0f  Bundle NOT deployed: the Databricks CLI is not available in this app\n"
+            "   container, so only the Git folder was refreshed and databricks.yml changes\n"
+            "   have not been applied. Install the CLI into the app image or set\n"
+            "   DATABRICKS_CLI_PATH, or run the deploy from the local stdio server."
+        )
+
+    project_dir, error = _materialize_bundle(client)
+    if error:
+        return pulled + f"\n\u26a0\ufe0f  Bundle NOT deployed: {error}"
+
+    # --auto-approve: nothing can answer an interactive prompt in an app container.
+    rc, out = _run(
+        [cli, "bundle", "deploy", "--target", target, "--auto-approve"],
+        project_dir,
+        timeout=DEPLOY_TIMEOUT_SECONDS,
+    )
+    if rc != 0:
+        return pulled + f"\n\u274c bundle deploy failed:\n{out[-2000:]}"
+
+    lines = [pulled.rstrip(), "", "\u2705 Bundle deployed", f"   Target: {target}"]
+    deployed = _deployed_job_names(cli, project_dir, target)
+    if deployed:
+        lines.append(f"   Deployed jobs:\n{deployed}")
+    if out:
+        lines.append(f"   Output: {out[-800:]}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +354,10 @@ def run_job(job_name: str = "sample_transform_job", prevent_duplicate: bool = Tr
         Run ID and estimated duration, or duplicate-run warning.
     """
     client = _get_client()
-    job = _find_job(client, job_name)
-    if not job:
-        return f"\u274c Job \'{job_name}\' not found. Deploy first with the `deploy` tool."
+    try:
+        job = _find_job(client, job_name)
+    except JobNotResolved as exc:
+        return f"\u274c {exc}"
 
     job_id = job.job_id
 
@@ -188,35 +400,83 @@ def run_job(job_name: str = "sample_transform_job", prevent_duplicate: bool = Tr
 # Tool 3: Get Job Status
 # ---------------------------------------------------------------------------
 
+# Result states that mean the run did not finish cleanly.
+_FAILED_RESULT_STATES = {
+    RunResultState.FAILED,
+    RunResultState.TIMEDOUT,
+    RunResultState.SUCCESS_WITH_FAILURES,
+    RunResultState.UPSTREAM_FAILED,
+}
+
+
+def _termination_summary(holder) -> Optional[str]:
+    """Termination code + message from the newer `status` field, when the SDK exposes it."""
+    status = getattr(holder, "status", None)
+    details = getattr(status, "termination_details", None) if status else None
+    if not details:
+        return None
+    code = getattr(details, "code", None)
+    code = code.value if hasattr(code, "value") else code
+    message = getattr(details, "message", None)
+    return " - ".join(str(p) for p in (code, message) if p) or None
+
+
+def _task_output_lines(client: WorkspaceClient, task_run_id: int, indent: str = "   ") -> list:
+    """Exception and stack trace for a single *task* run.
+
+    `get_run_output` only accepts a task run_id. Passing the job-level run_id of a
+    multi-task run - and every DAB job uses the multi-task format, even with one
+    task - returns HTTP 400, which is why in-job errors never surfaced here.
+    """
+    try:
+        output = client.jobs.get_run_output(run_id=task_run_id)
+    except Exception as exc:
+        return [f"{indent}(Could not retrieve output for task run {task_run_id}: {exc})"]
+
+    lines = []
+    if output.error:
+        lines.append(f"{indent}Exception   : {output.error}")
+    if output.error_trace:
+        trace = output.error_trace[-4000:]  # last 4000 chars
+        lines.append(f"{indent}Stack Trace :\n{trace}")
+    notebook_output = getattr(output, "notebook_output", None)
+    if notebook_output is not None and getattr(notebook_output, "result", None):
+        lines.append(f"{indent}Notebook Exit: {notebook_output.result}")
+    if not lines:
+        lines.append(f"{indent}(No exception trace recorded for this task.)")
+    return lines
+
+
 @mcp.tool()
 def get_job_status(run_id: Optional[int] = None, job_name: str = "sample_transform_job") -> str:
     """
-    Check the status of a job run with full error details on failure.
-
-    Returns lifecycle state, result, duration, and complete error code +
-    exception stack trace if the run failed.
+    Check the status of a job run. Returns lifecycle state, result, duration,
+    and full error details (error code + exception trace) on failure.
 
     Args:
         run_id: Specific run ID. If omitted, fetches the most recent run.
         job_name: Used to resolve the latest run when run_id is not provided.
 
     Returns:
-        Structured status report with failure diagnostics.
+        Structured status report; includes per-task stack traces if the run failed.
     """
     client = _get_client()
 
+    # Resolve run_id if not provided
     if run_id is None:
-        job = _find_job(client, job_name)
-        if not job:
-            return f"\u274c Job \'{job_name}\' not found."
+        try:
+            job = _find_job(client, job_name)
+        except JobNotResolved as exc:
+            return f"\u274c {exc}"
         runs = list(client.jobs.list_runs(job_id=job.job_id, limit=1))
         if not runs:
-            return f"\u2139\ufe0f  No runs recorded for \'{job_name}\'."
+            return f"\u2139\ufe0f  No runs recorded for '{job_name}'."
         run_id = runs[0].run_id
 
     run = client.jobs.get_run(run_id=run_id)
     state = run.state
-    lifecycle = state.life_cycle_state.value if state.life_cycle_state else "UNKNOWN"
+    lifecycle = state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+    result_state = state.result_state if state else None
 
     lines = [
         "\U0001f4cb Job Run Status",
@@ -225,42 +485,68 @@ def get_job_status(run_id: Optional[int] = None, job_name: str = "sample_transfo
         f"   Lifecycle   : {lifecycle}",
     ]
 
-    if state.result_state:
-        lines.append(f"   Result      : {state.result_state.value}")
+    if result_state:
+        lines.append(f"   Result      : {result_state.value}")
+
     if run.start_time:
         lines.append(f"   Started     : {datetime.fromtimestamp(run.start_time / 1000).isoformat()}")
-    if run.execution_duration:
-        m, s = divmod(int(run.execution_duration / 1000), 60)
+
+    duration_ms = run.execution_duration or run.run_duration
+    if duration_ms:
+        m, s = divmod(int(duration_ms / 1000), 60)
         lines.append(f"   Duration    : {m}m {s}s")
 
-    # Failure details
-    if state.result_state == RunResultState.FAILED:
+    if run.run_page_url:
+        lines.append(f"   Run Page    : {run.run_page_url}")
+
+    failed = (
+        result_state in _FAILED_RESULT_STATES
+        or (state and state.life_cycle_state == RunLifeCycleState.INTERNAL_ERROR)
+    )
+
+    # --- Failure details ---
+    if failed:
         lines.append("")
         lines.append("   \u274c FAILURE DETAILS")
-        if state.state_message:
-            lines.append(f"   Message: {state.state_message}")
+        if state and state.state_message:
+            lines.append(f"   Message     : {state.state_message}")
+        summary = _termination_summary(run)
+        if summary:
+            lines.append(f"   Termination : {summary}")
 
-        if run.tasks:
-            for task in run.tasks:
-                ts = task.state
-                if ts and ts.result_state == RunResultState.FAILED:
-                    lines.append(f"   Failed Task : {task.task_key}")
-                    if ts.state_message:
-                        lines.append(f"   Task Error  : {ts.state_message}")
+        tasks = run.tasks or []
+        failed_tasks = [
+            t for t in tasks if t.state and t.state.result_state in _FAILED_RESULT_STATES
+        ]
+        if not failed_tasks:
+            # Run failed before any task reported a result (compute/setup errors).
+            failed_tasks = [
+                t for t in tasks
+                if not (t.state and t.state.result_state == RunResultState.SUCCESS)
+            ]
 
-        try:
-            output = client.jobs.get_run_output(run_id=run_id)
-            if output.error:
-                lines.append(f"   Exception   : {output.error}")
-            if output.error_trace:
-                trace = output.error_trace[-2000:]
-                lines.append(f"   Stack Trace :\n{trace}")
-        except Exception:
-            lines.append("   (Could not retrieve run output for trace)")
+        for task in failed_tasks:
+            ts = task.state
+            lines.append("")
+            lines.append(f"   -- Task '{task.task_key}' (task run_id: {task.run_id}) --")
+            if ts and ts.result_state:
+                lines.append(f"   State       : {ts.result_state.value}")
+            if ts and ts.state_message:
+                lines.append(f"   Task Error  : {ts.state_message}")
+            task_summary = _termination_summary(task)
+            if task_summary:
+                lines.append(f"   Termination : {task_summary}")
+            if task.run_id:
+                lines.extend(_task_output_lines(client, task.run_id))
 
-    elif state.life_cycle_state == RunLifeCycleState.RUNNING:
+        if not tasks:
+            # Legacy single-task run: the job run_id *is* the task run_id.
+            lines.extend(_task_output_lines(client, run_id))
+
+    elif state and state.life_cycle_state == RunLifeCycleState.RUNNING:
         lines.append("\n   \U0001f504 Currently running...")
-    elif state.result_state == RunResultState.SUCCESS:
+
+    elif result_state == RunResultState.SUCCESS:
         lines.append("\n   \u2705 Completed successfully.")
 
     return "\n".join(lines)
@@ -285,9 +571,10 @@ def cancel_run(run_id: Optional[int] = None, job_name: str = "sample_transform_j
     client = _get_client()
 
     if run_id is None:
-        job = _find_job(client, job_name)
-        if not job:
-            return f"\u274c Job \'{job_name}\' not found."
+        try:
+            job = _find_job(client, job_name)
+        except JobNotResolved as exc:
+            return f"\u274c {exc}"
         active = list(client.jobs.list_runs(job_id=job.job_id, active_only=True))
         if not active:
             return f"\u2139\ufe0f  No active runs for \'{job_name}\' \u2014 nothing to cancel."
