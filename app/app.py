@@ -208,16 +208,18 @@ _SOURCE_SUFFIX = {
 def _pull_repo(client: WorkspaceClient, git_ref: str):
     """Pull the workspace Git folder to `git_ref`. Returns (head_commit, error).
 
-    Resolves the folder with `repos.get(repo_id=<path>)` rather than
-    `repos.list(path_prefix=...)`: `list` is deprecated and explicitly excludes
-    repos with Git CLI enabled, so it silently misses any folder cloned that
-    way -- reporting "not found" even when the folder is present and current.
-    `get` also accepts a path directly, sidestepping the prefix match against
-    WORKSPACE_REPO_PATH (which includes a leading "/Workspace" that `list`
-    results never carry, so it could never have matched there either).
+    `repos.get`/`repos.update` take a numeric repo_id, not a path -- unlike the
+    CLI's `repos get REPO_ID_OR_PATH`, which does this same path resolution
+    client-side before calling the API. So the folder's object_id has to be
+    looked up first, via `workspace.get_status`.
+
+    This also sidesteps `repos.list(path_prefix=...)`, used previously: `list`
+    is deprecated and explicitly excludes repos with Git CLI enabled, so it
+    silently missed this folder -- reporting "not found" even though the
+    folder was present and current.
     """
     try:
-        repo = client.repos.get(repo_id=WORKSPACE_REPO_PATH)
+        status = client.workspace.get_status(WORKSPACE_REPO_PATH)
     except Exception as e:
         msg = str(e)
         if "RESOURCE_DOES_NOT_EXIST" in msg or "does not exist" in msg.lower():
@@ -225,10 +227,17 @@ def _pull_repo(client: WorkspaceClient, git_ref: str):
                 f"Git folder not found at {WORKSPACE_REPO_PATH}.\n"
                 f"   Ensure the repo is cloned in the workspace."
             )
-        return None, f"Could not look up the Git folder at {WORKSPACE_REPO_PATH}:\n   {e}"
+        return None, f"Could not look up {WORKSPACE_REPO_PATH}:\n   {e}"
+
+    dir_info = getattr(status, "directory_info", None)
+    if not (dir_info and getattr(dir_info, "is_git_folder", False)) or status.object_id is None:
+        return None, (
+            f"{WORKSPACE_REPO_PATH} exists but is not a Git folder.\n"
+            f"   Ensure it was cloned as a Repo, not a plain workspace directory."
+        )
 
     try:
-        updated = client.repos.update(repo_id=repo.id, branch=git_ref)
+        updated = client.repos.update(repo_id=status.object_id, branch=git_ref)
     except Exception as e:
         return None, f"Failed to pull latest from '{git_ref}':\n   {e}"
     return getattr(updated, "head_commit_id", "unknown"), None
