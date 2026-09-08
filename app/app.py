@@ -206,17 +206,27 @@ _SOURCE_SUFFIX = {
 
 
 def _pull_repo(client: WorkspaceClient, git_ref: str):
-    """Pull the workspace Git folder to `git_ref`. Returns (head_commit, error)."""
-    repo = None
-    for r in client.repos.list(path_prefix=WORKSPACE_REPO_PATH):
-        if r.path and r.path.rstrip("/") == WORKSPACE_REPO_PATH.rstrip("/"):
-            repo = r
-            break
-    if not repo:
-        return None, (
-            f"Git folder not found at {WORKSPACE_REPO_PATH}.\n"
-            f"   Ensure the repo is cloned in the workspace."
-        )
+    """Pull the workspace Git folder to `git_ref`. Returns (head_commit, error).
+
+    Resolves the folder with `repos.get(repo_id=<path>)` rather than
+    `repos.list(path_prefix=...)`: `list` is deprecated and explicitly excludes
+    repos with Git CLI enabled, so it silently misses any folder cloned that
+    way -- reporting "not found" even when the folder is present and current.
+    `get` also accepts a path directly, sidestepping the prefix match against
+    WORKSPACE_REPO_PATH (which includes a leading "/Workspace" that `list`
+    results never carry, so it could never have matched there either).
+    """
+    try:
+        repo = client.repos.get(repo_id=WORKSPACE_REPO_PATH)
+    except Exception as e:
+        msg = str(e)
+        if "RESOURCE_DOES_NOT_EXIST" in msg or "does not exist" in msg.lower():
+            return None, (
+                f"Git folder not found at {WORKSPACE_REPO_PATH}.\n"
+                f"   Ensure the repo is cloned in the workspace."
+            )
+        return None, f"Could not look up the Git folder at {WORKSPACE_REPO_PATH}:\n   {e}"
+
     try:
         updated = client.repos.update(repo_id=repo.id, branch=git_ref)
     except Exception as e:
