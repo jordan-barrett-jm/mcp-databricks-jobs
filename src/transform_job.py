@@ -74,5 +74,10 @@ print(f"Total revenue: ${transformed.agg(F.sum('total_revenue')).first()[0]:,.2f
 
 # COMMAND ----------
 
+# Test cell: simple display of the output table
+display(transformed)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ### Job completed successfully ✅
