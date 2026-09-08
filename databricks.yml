@@ -24,16 +24,30 @@ resources:
   jobs:
     sample_transform_job:
       name: sample_transform_job_${bundle.target}
-      description: "Sample transform job deployed via DAB — used by MCP server"
+      description: "Ingest raw orders, then publish completed-order revenue by region — deployed via DAB, driven by the MCP server"
       tags:
         managed_by: "mcp-server"
         bundle: "sample_transform_bundle"
 
+      # Target for both tasks. Job parameters reach notebook tasks as widgets,
+      # so the notebooks read them with dbutils.widgets.get().
+      parameters:
+        - name: catalog
+          default: bronze_sandbox
+        - name: schema
+          default: mcp_jobs_demo
+
       # Serverless — no cluster spec required
       tasks:
-        - task_key: transform
+        - task_key: ingest_orders
           notebook_task:
-            notebook_path: ./src/transform_job.py
+            notebook_path: ./src/ingest_orders.py
+
+        - task_key: aggregate_sales
+          depends_on:
+            - task_key: ingest_orders
+          notebook_task:
+            notebook_path: ./src/aggregate_sales.py
 
       # Queue to prevent resource contention
       queue:

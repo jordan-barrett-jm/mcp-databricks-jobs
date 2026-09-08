@@ -250,8 +250,23 @@ mcp-databricks-jobs/
 ├── requirements.txt       # Python dependencies
 ├── README.md              # This file
 └── src/
-    └── transform_job.py   # Databricks notebook (the actual job code)
+    ├── ingest_orders.py    # Task 1 — lands synthetic orders in orders_raw
+    └── aggregate_sales.py  # Task 2 — publishes sales_by_region
 ```
+
+## The job
+
+`sample_transform_job` is a two-task serverless workflow:
+
+| Task | Depends on | Writes |
+| --- | --- | --- |
+| `ingest_orders` | — | `${catalog}.${schema}.orders_raw` |
+| `aggregate_sales` | `ingest_orders` | `${catalog}.${schema}.sales_by_region` |
+
+`catalog` and `schema` are job parameters (defaults `bronze_sandbox` /
+`mcp_jobs_demo`) and arrive in the notebooks as widgets. `sales_by_region` is
+created from an explicit `CREATE TABLE` contract rather than inferred from the
+DataFrame, so Delta enforces the declared column types on every write.
 
 ## Security Notes
 
