@@ -229,16 +229,23 @@ def _pull_repo(client: WorkspaceClient, git_ref: str):
             )
         return None, f"Could not look up {WORKSPACE_REPO_PATH}:\n   {e}"
 
-    dir_info = getattr(status, "directory_info", None)
-    if not (dir_info and getattr(dir_info, "is_git_folder", False)) or status.object_id is None:
-        return None, (
-            f"{WORKSPACE_REPO_PATH} exists but is not a Git folder.\n"
-            f"   Ensure it was cloned as a Repo, not a plain workspace directory."
-        )
+    if status.object_id is None:
+        return None, f"{WORKSPACE_REPO_PATH} has no object ID -- cannot resolve it to a repo."
 
+    # `directory_info.is_git_folder` would be the direct check, but it's a
+    # newer ObjectInfo field and isn't reliably present across SDK versions,
+    # so it isn't trustworthy as a pre-check here. repos.update() against this
+    # object_id is the operation that actually has to succeed, so let its own
+    # success or failure be the answer instead of guessing beforehand.
     try:
         updated = client.repos.update(repo_id=status.object_id, branch=git_ref)
     except Exception as e:
+        msg = str(e)
+        if "RESOURCE_DOES_NOT_EXIST" in msg or "does not exist" in msg.lower() or "No API found" in msg:
+            return None, (
+                f"{WORKSPACE_REPO_PATH} exists but is not a Git folder ({e}).\n"
+                f"   Ensure it was cloned as a Repo, not a plain workspace directory."
+            )
         return None, f"Failed to pull latest from '{git_ref}':\n   {e}"
     return getattr(updated, "head_commit_id", "unknown"), None
 
