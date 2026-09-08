@@ -61,6 +61,34 @@ def _matches_deployed_name(actual: str, wanted: str) -> bool:
     return base == wanted or base.startswith(wanted + "_")
 
 
+def _calling_principal(client: WorkspaceClient) -> Optional[str]:
+    """The identity this server calls Databricks as, lowercased.
+
+    For a service principal -- how the hosted app runs -- SCIM reports the
+    application ID here, which is also what Jobs records in creator_user_name.
+    Returns None if the lookup fails, so resolution degrades to the other
+    filters rather than erroring.
+    """
+    try:
+        return (client.current_user.me().user_name or "").lower() or None
+    except Exception:
+        return None
+
+
+def _bundle_managed(job) -> bool:
+    """True if DAB deployed this job, rather than a human creating it by hand."""
+    deployment = getattr(job.settings, "deployment", None) if job.settings else None
+    return getattr(deployment, "kind", None) is not None
+
+
+def _owned_by(job, principal: str) -> bool:
+    owners = {
+        (getattr(job, "creator_user_name", None) or "").lower(),
+        (getattr(job, "run_as_user_name", None) or "").lower(),
+    }
+    return principal in owners
+
+
 def _find_job(client: WorkspaceClient, job_name: str):
     """Resolve a job by the name DAB actually deploys it under.
 
@@ -69,9 +97,20 @@ def _find_job(client: WorkspaceClient, job_name: str):
     workspace as `[dev jordan_barrett] sample_transform_job_dev`. Matching on
     the exact string alone therefore never finds a bundle-deployed job.
 
-    An exact match wins outright. Otherwise the dev prefix is stripped and the
-    target suffix allowed, and an ambiguous result is reported rather than
-    guessed at -- pass the full workspace name as `job_name` to pin one down.
+    A bare name like "sample_transform_job" routinely matches several jobs at
+    once: one dev deploy per principal that has run `deploy`, plus any stale
+    hand-made job that happens to hold the name outright. An exact match must
+    NOT win on that basis alone -- the hand-made job would shadow the one this
+    server actually deploys, and `get_job_status` would keep reporting its last
+    run. That failure is silent and reads as success, which is worse than no
+    answer at all.
+
+    So matches are narrowed rather than short-circuited: bundle-deployed jobs
+    beat unmanaged ones, then this server's own deploys beat other principals'.
+    Each filter only applies if something survives it, so a partial response
+    from the Jobs API costs precision, not correctness. Whatever is still
+    ambiguous at the end is reported rather than guessed at -- pass the full
+    workspace name as `job_name` to pin one down.
 
     Raises:
         JobNotResolved: if the name matches no job, or several.
@@ -81,15 +120,25 @@ def _find_job(client: WorkspaceClient, job_name: str):
         name = job.settings.name if job.settings else None
         if not name:
             continue
-        if name == job_name:
-            return job
-        if _matches_deployed_name(name, job_name):
+        if name == job_name or _matches_deployed_name(name, job_name):
             candidates.append(job)
 
     if not candidates:
         raise JobNotResolved(
             f"Job '{job_name}' not found. Deploy first with the `deploy` tool."
         )
+
+    if len(candidates) > 1:
+        managed = [j for j in candidates if _bundle_managed(j)]
+        if managed:
+            candidates = managed
+
+    if len(candidates) > 1:
+        principal = _calling_principal(client)
+        mine = [j for j in candidates if principal and _owned_by(j, principal)]
+        if mine:
+            candidates = mine
+
     if len(candidates) > 1:
         listed = "\n".join(
             f"     - {j.settings.name} (ID: {j.job_id})" for j in candidates
