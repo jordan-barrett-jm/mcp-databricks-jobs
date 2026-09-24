@@ -18,7 +18,7 @@ dbutils.widgets.text("schema", "mcp_jobs_demo")
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 
-raw_table = f"{catalog}.{schema}.orders_raw_v2"
+raw_table = f"{catalog}.{schema}.orders_raw"
 report_table = f"{catalog}.{schema}.sales_by_region"
 
 print(f"Reading {raw_table} -> writing {report_table}")

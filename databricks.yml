@@ -33,7 +33,7 @@ resources:
       # so the notebooks read them with dbutils.widgets.get().
       parameters:
         - name: catalog
-          default: bronze_sandbox
+          default: bronze_sandbox_typo
         - name: schema
           default: mcp_jobs_demo
 
