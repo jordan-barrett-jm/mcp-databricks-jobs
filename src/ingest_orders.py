@@ -74,6 +74,8 @@ schema_def = StructType([
     StructField("order_date", TimestampType(), False),
 ])
 
+raise RuntimeError("upstream feed unavailable: order source returned no partitions")
+
 orders_df = spark.createDataFrame(data, schema=schema_def)
 
 # COMMAND ----------
