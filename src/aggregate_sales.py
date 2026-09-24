@@ -18,7 +18,7 @@ dbutils.widgets.text("schema", "mcp_jobs_demo")
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 
-raw_table = f"{catalog}.{schema}.orders_raw"
+raw_table = f"{catalog}.{schema}.orders_raw_v2"
 report_table = f"{catalog}.{schema}.sales_by_region"
 
 print(f"Reading {raw_table} -> writing {report_table}")
@@ -67,7 +67,7 @@ sales = (
     .agg(
         F.count("order_id").alias("order_count"),
         F.sum("gross_revenue").cast("decimal(12,2)").alias("gross_revenue"),
-        F.sum("net_revenue").alias("net_revenue"),
+        F.sum("net_revenue").cast("decimal(12,2)").alias("net_revenue"),
         F.avg("net_revenue").alias("avg_order_value"),
         F.max("order_date").alias("latest_order"),
     )
