@@ -67,7 +67,7 @@ sales = (
     .agg(
         F.count("order_id").alias("order_count"),
         F.sum("gross_revenue").cast("decimal(12,2)").alias("gross_revenue"),
-        F.sum("net_revenue").cast("decimal(12,2)").alias("net_revenue"),
+        F.sum("net_revenue").alias("net_revenue"),
         F.avg("net_revenue").alias("avg_order_value"),
         F.max("order_date").alias("latest_order"),
     )
