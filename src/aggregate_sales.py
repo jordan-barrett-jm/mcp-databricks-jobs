@@ -56,7 +56,6 @@ orders = spark.table(raw_table)
 
 priced = (
     orders
-    .filter(F.col("status") == "completed")
     .withColumn("gross_revenue", F.col("unit_price") * F.col("quantity"))
     .withColumn("net_revenue", F.col("gross_revenue") * (F.lit(1.0) - F.col("discount_pct")))
 )
