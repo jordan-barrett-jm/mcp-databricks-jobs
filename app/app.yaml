@@ -8,4 +8,4 @@ command:
 env:
   - name: WORKSPACE_REPO_PATH
     description: "Workspace Git folder path — the deploy tool pulls latest code here"
-    value: "/Workspace/Users/jordan.barrett@factored.ai/mcp-databricks-jobs"
+    value: "/Workspace/Users/you@example.com/mcp-databricks-jobs"

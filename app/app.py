@@ -44,7 +44,7 @@ DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
 # Workspace Git folder path — the app pulls latest code here via the Repos API
 WORKSPACE_REPO_PATH = os.environ.get(
     "WORKSPACE_REPO_PATH",
-    "/Workspace/Users/jordan.barrett@factored.ai/mcp-databricks-jobs"
+    "/Workspace/Users/you@example.com/mcp-databricks-jobs"
 )
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ def _get_client() -> WorkspaceClient:
 
 
 # DAB's `mode: development` prefixes every deployed resource, e.g.
-# "[dev jordan_barrett] sample_transform_job_dev".
+# "[dev <your-username>] sample_transform_job_dev".
 _DEV_PREFIX = re.compile(r"^\[[^\]]*\]\s*")
 
 
@@ -121,7 +121,7 @@ def _find_job(client: WorkspaceClient, job_name: str):
 
     databricks.yml names the job `sample_transform_job_${bundle.target}`, and
     `mode: development` prefixes it further, so a dev deploy lands in the
-    workspace as `[dev jordan_barrett] sample_transform_job_dev`. Matching on
+    workspace as `[dev <your-username>] sample_transform_job_dev`. Matching on
     the exact string alone therefore never finds a bundle-deployed job.
 
     A bare name like "sample_transform_job" routinely matches several jobs at

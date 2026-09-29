@@ -46,7 +46,7 @@ environment — in VS Code, Codex, Claude Desktop, or any MCP-compatible client.
 The MCP server is also deployed as a Databricks App: **mcp-jobs-server**, reachable at:
 
 ```
-https://mcp-jobs-server-3317548451194413.aws.databricksapps.com/mcp
+https://<app-url>/mcp
 ```
 
 Source for the hosted version lives in `app/` (`app.py`, `app.yaml`, `requirements.txt`) and uses
@@ -202,7 +202,7 @@ python mcp_server.py
 
 DAB does not deploy the job under the name in `databricks.yml`. The bundle names it
 `sample_transform_job_${bundle.target}`, and `mode: development` prefixes it again, so a dev
-deploy lands in the workspace as `[dev jordan_barrett] sample_transform_job_dev`.
+deploy lands in the workspace as `[dev <your-username>] sample_transform_job_dev`.
 
 The tools account for this: `job_name` is matched exactly first, then against the deployed
 name with the dev prefix stripped and the target suffix allowed. If a name matches several

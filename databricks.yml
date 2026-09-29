@@ -13,12 +13,12 @@ workspace:
 # asked for it -- not even View permission.
 permissions:
   - level: CAN_MANAGE
-    user_name: jordan.barrett@factored.ai
+    user_name: you@example.com
   # Both principals deploy this bundle, so both are named explicitly. Without
   # its own entry the CLI warns that CAN_MANAGE grants only take effect when
   # the deploying identity is itself listed.
   - level: CAN_MANAGE
-    service_principal_name: 3a75ae6d-6747-4a0a-a764-bab29932cde2
+    service_principal_name: <app-service-principal-id>  # the hosted app's service principal application ID
 
 resources:
   jobs:
